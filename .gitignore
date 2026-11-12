@@ -1,0 +1,27 @@
+# Gradle and Kotlin caches
+.gradle/
+.kotlin/
+
+# Build output in all modules
+build/
+out/
+*.class
+
+# IntelliJ IDEA
+.idea/
+*.iml
+*.ipr
+*.iws
+
+# macOS
+.DS_Store
+._*
+
+# Local environment variables
+.env
+.env.*
+!.env.example
+!.env.sample
+
+# Gradle Wrapper belongs in version control
+!gradle/wrapper/gradle-wrapper.jar
