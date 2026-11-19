@@ -1,0 +1,1126 @@
+openapi: 3.0.3
+info:
+  title: API заявок на волонтерскую помощь
+  version: 1.0.0
+  description: |-
+    API заявок на волонтерскую помощь и откликов.
+    Просмотр заявок публичный; изменения и личные списки требуют Bearer-токен.
+    Статус заявок:
+    open — поиск волонтеров, in_progress — выполнение, closed — закрыта без выполнения,
+    completed — выполнена.
+tags:
+  - name: Auth
+    description: |-
+      Регистрация и вход по email и паролю. JWT access действует до 15 минут,
+      сессия — 7 дней с момента создания.
+      JWT sub содержит UUID пользователя (назначается Auth, общий для всех сервисов).
+      При разных origin нужны credentials и CORS с явным разрешенным origin.
+      Восстановление пароля и подтверждение email запланированы на будущую версию.
+  - name: Tasks
+    description: Заявки на помощь
+  - name: TaskResponses
+    description: Отклики волонтеров
+paths:
+  /api/v1/auth/register:
+    post:
+      tags: [Auth]
+      operationId: registerUser
+      summary: Зарегистрировать аккаунт и войти
+      description: |-
+        Создает аккаунт по email и паролю и пустой профиль. После активации аккаунта автоматически создает
+        сессию и выдает токены; заполнение профиля для входа не требуется.
+        Сессия истекает через 7 дней с момента ее создания.
+        201 возвращается только после активации. Если подтверждение создания профиля
+        не получено за время ожидания, возвращается 503 REGISTRATION_PENDING без токенов.
+        При регистрация продолжается в фоне, аккаунт не удаляется; после активации
+        пользователь может войти через login. Повтор регистрации занятого email — 409.
+      security: []
+      requestBody:
+        $ref: '#/components/requestBodies/AuthCredentials'
+      responses:
+        '201':
+          $ref: '#/components/responses/AuthTokens'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '403':
+          $ref: '#/components/responses/AuthOriginRejected'
+        '409':
+          description: Email уже занят, в том числе регистрацией в обработке (EMAIL_ALREADY_EXISTS).
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '503':
+          description: Активация еще не завершена (REGISTRATION_PENDING); токены не выданы.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+  /api/v1/auth/login:
+    post:
+      tags: [Auth]
+      operationId: login
+      summary: Войти в аккаунт
+      description: |-
+        Проверяет email и пароль активного аккаунта, создает сессию на 7 дней
+        и выдает токены. Неверный email или пароль дают ошибку 401
+        INVALID_CREDENTIALS. Для верных данных аккаунта pending_profile — 409
+        ACCOUNT_NOT_ACTIVE; клиент может повторить вход после активации.
+      security: []
+      requestBody:
+        $ref: '#/components/requestBodies/AuthCredentials'
+      responses:
+        '200':
+          $ref: '#/components/responses/AuthTokens'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/AuthUnauthorized'
+        '403':
+          $ref: '#/components/responses/AuthOriginRejected'
+        '409':
+          description: Аккаунт еще не активирован (ACCOUNT_NOT_ACTIVE).
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+  /api/v1/auth/refresh:
+    post:
+      tags: [Auth]
+      operationId: refreshTokens
+      summary: Обновить access и заменить refresh
+      description: |-
+        Принимает текущий refresh; тело запроса и access не требуются.
+        Проверяет хеш refresh, отсутствие отзыва и now < sessionExpiresAt.
+        Заменяет refresh и выдает новый access.
+        Истекшая или отозванная сессия — 401; требуется повторный вход.
+      security:
+        - refreshCookie: []
+      responses:
+        '200':
+          $ref: '#/components/responses/AuthTokens'
+        '401':
+          $ref: '#/components/responses/AuthUnauthorized'
+        '403':
+          $ref: '#/components/responses/AuthOriginRejected'
+  /api/v1/auth/logout:
+    post:
+      tags: [Auth]
+      operationId: logout
+      summary: Завершить текущую сессию
+      description: |-
+        По refresh отзывает соответствующую сессию.
+        Тело запроса и access не требуются. Другие сессии пользователя не отзываются.
+        Уже выданный JWT access действует до своего срока: проверки отзыва сессии
+        на каждом запросе нет. Клиент удаляет сохраненный access после выхода.
+        Отсутствующий, истекший, отозванный или уже замененный refresh — 401.
+      security:
+        - refreshCookie: []
+      responses:
+        '204':
+          description: Сессия отозвана; ответ без тела.
+          headers:
+            Set-Cookie:
+              $ref: '#/components/headers/ClearRefreshCookie'
+            Cache-Control:
+              $ref: '#/components/headers/NoStore'
+        '401':
+          description: Refresh отсутствует или недействителен; активная сессия не отозвана.
+          headers:
+            Set-Cookie:
+              $ref: '#/components/headers/ClearRefreshCookie'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '403':
+          $ref: '#/components/responses/AuthOriginRejected'
+  /api/v1/help/tasks:
+    post:
+      summary: Создать заявку
+      description: |-
+        Доступно авторизованным пользователям. Автор определяется по токену.
+        Описание помощи и место обязательны.
+        Фотографии, видео, количество волонтеров и предложение взамен необязательны.
+
+        Начальный статус — open. Описание до 1000 символов, максимум 10 файлов.
+        Если volunteersNeeded не указан, число участников не ограничено.
+        Если количество участников не указано, начало выполнения возможно только вручную автором.
+        searchDeadline необязателен; если передан, должен быть в будущем, иначе 400.
+      operationId: createTask
+      tags:
+        - Tasks
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          multipart/form-data:
+            schema:
+              $ref: '#/components/schemas/CreateTaskRequest'
+            encoding:
+              files:
+                contentType: image/*, video/*
+      responses:
+        '201':
+          description: Заявка создана
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Task'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '413':
+          $ref: '#/components/responses/PayloadTooLarge'
+        '415':
+          $ref: '#/components/responses/UnsupportedMediaType'
+    get:
+      summary: Получить список заявок
+      description: |-
+        Публичный список заявок.
+        Для authorId=me или assigneeId=me требуется действительный токен (иначе 401).
+        При передаче конкретного ID фильтра просмотр остается публичным.
+        assigneeId выбирает заявки с одобренным участием, включая выполненные;
+        отозванное участие в этот список не входит. Без фильтра статуса возвращаются все статусы.
+      operationId: listTasks
+      tags:
+        - Tasks
+      security:
+        - {}
+        - bearerAuth: []
+      parameters:
+        - name: status
+          in: query
+          description: Необязательный фильтр по статусу; без него возвращаются все статусы.
+          schema:
+            $ref: '#/components/schemas/TaskStatus'
+        - name: authorId
+          in: query
+          description: ID автора или me для текущего пользователя.
+          schema:
+            oneOf:
+              - type: string
+                format: uuid
+              - type: string
+                enum: [me]
+        - name: assigneeId
+          in: query
+          description: ID одобренного исполнителя или me.
+          schema:
+            oneOf:
+              - type: string
+                format: uuid
+              - type: string
+                enum: [me]
+        - $ref: '#/components/parameters/Limit'
+        - $ref: '#/components/parameters/Offset'
+      responses:
+        '200':
+          description: Страница списка заявок; при отсутствии результатов items пуст.
+          content:
+            application/json:
+              schema:
+                type: object
+                required:
+                  - items
+                  - total
+                  - limit
+                  - offset
+                properties:
+                  items:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/Task'
+                  total:
+                    type: integer
+                    minimum: 0
+                    description: Общее количество заявок с учетом фильтра.
+                  limit:
+                    type: integer
+                    minimum: 1
+                    maximum: 100
+                  offset:
+                    type: integer
+                    minimum: 0
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+  /api/v1/help/tasks/{taskId}:
+    parameters:
+      - $ref: '#/components/parameters/TaskId'
+    get:
+      summary: Получить заявку
+      description: Публичный просмотр конкретной заявки.
+      operationId: getTask
+      tags:
+        - Tasks
+      security: []
+      responses:
+        '200':
+          description: Заявка найдена
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Task'
+        '404':
+          $ref: '#/components/responses/NotFound'
+    patch:
+      summary: Изменить заявку
+      description: |-
+        Только автор может изменить заявку в open или in_progress, иначе 409.
+        Пропущенные поля сохраняют значения. files добавляет вложения, removeFileIds удаляет их.
+        После добавления должно остаться не более 10 файлов, иначе 400.
+        Пустая строка offer очищает предложение взамен. Автор и исполнители не меняются напрямую.
+        Если в open новое volunteersNeeded равно числу одобренных участников (не менее одного),
+        заявка автоматически переходит в in_progress. Меньшее количество — 409.
+        Увеличение количества в in_progress не открывает набор: автор отдельно возвращает заявку в open.
+        Все изменения, включая автоматический переход статуса, применяются атомарно.
+      operationId: updateTask
+      tags:
+        - Tasks
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          multipart/form-data:
+            schema:
+              $ref: '#/components/schemas/UpdateTaskRequest'
+            encoding:
+              files:
+                contentType: image/*, video/*
+      responses:
+        '200':
+          description: Заявка изменена
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Task'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '413':
+          $ref: '#/components/responses/PayloadTooLarge'
+        '415':
+          $ref: '#/components/responses/UnsupportedMediaType'
+    delete:
+      summary: Удалить заявку
+      description: |-
+        Автор может удалить заявку в статусе open, in_progress или closed.
+        Если заявка уже была переведена в completed, 409 Conflict.
+        При успешном удалении сервер возвращает 204 без тела. 
+        Заявка и ее отклики исчезают из списков и недоступны по ID (404).
+      operationId: deleteTask
+      tags:
+        - Tasks
+      security:
+        - bearerAuth: []
+      responses:
+        '204':
+          description: Заявка удалена
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+  /api/v1/help/tasks/{taskId}/responses:
+    parameters:
+      - $ref: '#/components/parameters/TaskId'
+    post:
+      summary: Откликнуться на заявку
+      description: |-
+        Только авторизованный пользователь; volunteerId определяется по токену.
+        Создает новый отклик pending, не назначая исполнителя и не меняя статус заявки.
+        Автор не может откликаться на свою заявку (403). Если acceptingResponses=false — 409.
+        После rejected, withdrawn или cancelled можно создать новый отклик с новым ID.
+        Тело запроса не требуется.
+      operationId: createTaskResponse
+      tags:
+        - TaskResponses
+      security:
+        - bearerAuth: []
+      responses:
+        '201':
+          description: Отклик создан и ожидает одобрения автора
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TaskResponse'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+    get:
+      summary: Получить отклики на заявку
+      description: Только автор заявки. Возвращает все отклики, включая отклоненные и отозванные.
+      operationId: listTaskResponses
+      tags:
+        - TaskResponses
+      security:
+        - bearerAuth: []
+      responses:
+        '200':
+          description: Операция выполнена
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TaskResponsePage'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+      parameters:
+        - name: status
+          in: query
+          description: Необязательный фильтр статуса отклика; без фильтра — вся история.
+          schema:
+            $ref: '#/components/schemas/ResponseStatus'
+        - $ref: '#/components/parameters/Limit'
+        - $ref: '#/components/parameters/Offset'
+  /api/v1/help/tasks/{taskId}/responses/{responseId}:
+    parameters:
+      - $ref: '#/components/parameters/TaskId'
+      - $ref: '#/components/parameters/ResponseId'
+    get:
+      summary: Получить отклик
+      description: Доступен автору заявки и автору отклика. Отсутствующий отклик или отклик другой заявки
+        — 404.
+      operationId: getTaskResponse
+      tags:
+        - TaskResponses
+      security:
+        - bearerAuth: []
+      responses:
+        '200':
+          description: Операция выполнена
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TaskResponse'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+    patch:
+      summary: Одобрить или отклонить отклик
+      description: |-
+        Только автор заявки. status=approved или rejected.
+        Отклик другой заявки — 404. Заявка должна быть в open, иначе 409.
+        Одобрение добавляет волонтера в assigneeIds. Если volunteersNeeded задан и число
+        одобренных участников достигло этого значения, заявка автоматически переходит в in_progress.
+        Если нужно несколько участников и одобрены не все, заявка остается open.
+        Если количество не указано, автоматического старта нет.
+        При отсутствии мест — 409.
+        Остальные отклики pending при старте сохраняются: решения по ним возможны после возврата в open.
+        Отклонение не назначает участника; причина необязательна.
+        Повтор уже принятого решения возвращает текущий отклик (200), даже после старта заявки;
+        другое решение для обработанного отклика — 409.
+      operationId: decideTaskResponse
+      tags:
+        - TaskResponses
+      security:
+        - bearerAuth: []
+      responses:
+        '200':
+          description: Операция выполнена
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TaskResponse'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/DecideTaskResponseRequest'
+    delete:
+      summary: Отозвать отклик или отказаться от участия
+      description: |-
+        Только автор отклика. pending → withdrawn означает отзыв отклика.
+        approved → withdrawn разрешен в open и in_progress и означает отказ от участия:
+        волонтер удаляется из assigneeIds.
+        Если в in_progress остались участники, статус сохраняется; автор может открыть добор.
+        Если ушел последний участник, заявка автоматически возвращается в open.
+        Если при таком возврате старый searchDeadline уже истек, заявка сразу закрывается
+        с closeReason=search_expired; автор может открыть ее заново с новым сроком или без срока.
+        Отказ от участия в completed запрещен (409). rejected и cancelled менять нельзя (409).
+        Повтор для withdrawn возвращает 200 без изменений. Отклик другой заявки — 404.
+      operationId: withdrawTaskResponse
+      tags:
+        - TaskResponses
+      security:
+        - bearerAuth: []
+      responses:
+        '200':
+          description: Операция выполнена
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TaskResponse'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+  /api/v1/help/me/responses:
+    get:
+      summary: Получить свои отклики
+      description: Пользователь определяется по токену. Возвращает свои отклики и решения по ним, включая
+        историю повторных откликов.
+      operationId: listMyResponses
+      tags:
+        - TaskResponses
+      security:
+        - bearerAuth: []
+      responses:
+        '200':
+          description: Операция выполнена
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TaskResponsePage'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+      parameters:
+        - name: status
+          in: query
+          description: Необязательный фильтр статуса отклика; без фильтра — вся история.
+          schema:
+            $ref: '#/components/schemas/ResponseStatus'
+        - name: taskId
+          in: query
+          description: Необязательный фильтр по заявке.
+          schema:
+            type: string
+            minLength: 1
+        - $ref: '#/components/parameters/Limit'
+        - $ref: '#/components/parameters/Offset'
+  /api/v1/help/tasks/{taskId}/status:
+    parameters:
+      - $ref: '#/components/parameters/TaskId'
+    patch:
+      summary: Изменить статус заявки
+      description: |-
+        Только автор может менять статус вручную; волонтеру возвращается 403.
+        Разрешенные переходы:
+        - open → in_progress: есть хотя бы один одобренный участник; можно начать до заполнения мест.
+        - in_progress → open: автор открывает добор; имеющиеся участники сохраняются.
+          Если количество задано, должны быть свободные места, иначе 409.
+        - open или in_progress → closed: автор закрывает заявку без выполнения.
+        - closed → open: автор повторно открывает поиск.
+        - in_progress → completed: автор отмечает выполнение всей заявки.
+        completed — конечное состояние. Другие переходы и повтор текущего статуса — 409.
+        При переходе в open обязательно передать searchDeadline: будущую дату либо null
+        для поиска без срока; прошедшая дата или отсутствие поля — 400.
+        При закрытии pending и approved становятся cancelled, assigneeIds очищается;
+        отклики сохраняются в истории и не восстанавливаются при повторном открытии.
+        При завершении approved и assigneeIds сохраняются, pending становятся rejected
+        с причиной «Заявка завершена». Новые отклики и изменения в completed запрещены.
+        reason — необязательное публичное пояснение при закрытии; для других переходов запрещено.
+        Все связанные изменения атомарны. Если срок поиска истек в open, сервер сначала
+        закрывает заявку с closeReason=search_expired; переходы оцениваются из closed.
+        Срок не закрывает заявку в in_progress.
+        При ручном закрытии closeReason=author_closed, reason записывается в closeComment.
+        При автоматическом закрытии применяются те же правила отмены откликов.
+      operationId: changeTaskStatus
+      tags:
+        - Tasks
+      security:
+        - bearerAuth: []
+      responses:
+        '200':
+          description: Операция выполнена
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Task'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ChangeTaskStatusRequest'
+components:
+  securitySchemes:
+    refreshCookie:
+      type: apiKey
+      in: cookie
+      name: refreshToken
+      description: Текущий refresh-токен сессии; передается браузером в HttpOnly cookie.
+    bearerAuth:
+      type: http
+      scheme: bearer
+  parameters:
+    TaskId:
+      name: taskId
+      in: path
+      required: true
+      description: Идентификатор заявки.
+      schema:
+        type: string
+        minLength: 1
+      example: task-42
+    ResponseId:
+      name: responseId
+      in: path
+      required: true
+      description: Идентификатор отклика, принадлежащего указанной заявке.
+      schema:
+        type: string
+        minLength: 1
+    Limit:
+      name: limit
+      in: query
+      description: Размер страницы.
+      schema:
+        type: integer
+        minimum: 1
+        maximum: 100
+        default: 20
+    Offset:
+      name: offset
+      in: query
+      description: 'Число пропускаемых записей. Порядок: createdAt по убыванию, затем id по возрастанию.'
+      schema:
+        type: integer
+        minimum: 0
+        default: 0
+  headers:
+    NoStore:
+      description: Запрет кеширования ответа с токенами.
+      schema:
+        type: string
+        enum: [no-store]
+    RefreshCookie:
+      description: |-
+        Новый refresh; Secure; HttpOnly; SameSite=Strict; Path=/api/v1/auth; без Domain.
+        Max-Age — оставшееся время до sessionExpiresAt в секундах (не более 604800),
+        при ротации срок не начинается заново. Значение refresh не возвращается в JSON.
+      schema:
+        type: string
+      example: refreshToken=opaque-token; Path=/api/v1/auth; Max-Age=604800; HttpOnly; Secure; SameSite=Strict
+    ClearRefreshCookie:
+      description: Удаляет refresh cookie с теми же Path и атрибутами.
+      schema:
+        type: string
+      example: refreshToken=; Path=/api/v1/auth; Max-Age=0; HttpOnly; Secure; SameSite=Strict
+  requestBodies:
+    AuthCredentials:
+      required: true
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/AuthCredentialsRequest'
+  schemas:
+    AuthCredentialsRequest:
+      type: object
+      additionalProperties: false
+      required: [email, password]
+      properties:
+        email:
+          type: string
+          format: email
+          description: Email аккаунта; правило нормализации должно совпадать при регистрации и входе.
+          example: volunteer@example.com
+        password:
+          type: string
+          format: password
+          minLength: 1
+          writeOnly: true
+          description: Пароль; окончательная политика сложности определяется отдельно.
+    AuthTokenResponse:
+      type: object
+      additionalProperties: false
+      required: [accessToken, tokenType, accessExpiresAt, sessionExpiresAt]
+      properties:
+        accessToken:
+          type: string
+          minLength: 1
+          description: JWT для запросов к API. Refresh передается только через Set-Cookie.
+        tokenType:
+          type: string
+          enum: [Bearer]
+        accessExpiresAt:
+          type: string
+          format: date-time
+          description: min(время выдачи + 15 минут, sessionExpiresAt); соответствует exp JWT.
+          example: '2026-11-02T09:15:00Z'
+        sessionExpiresAt:
+          type: string
+          format: date-time
+          description: Время создания сессии + 7 дней (604800 секунд); неизменно при ротации.
+          example: '2026-11-09T09:00:00Z'
+    CreateTaskRequest:
+      type: object
+      additionalProperties: false
+      required:
+        - description
+        - location
+      properties:
+        title:
+          type: string
+          minLength: 1
+          pattern: \S
+          description: Необязательное название заявки; строка из одних пробелов не допускается.
+        description:
+          type: string
+          minLength: 1
+          description: Описание необходимой помощи; строка из одних пробелов не допускается.
+          example: Нужна помощь с перевозкой вещей
+          maxLength: 1000
+          pattern: \S
+        location:
+          type: string
+          minLength: 1
+          description: Место оказания помощи; строка из одних пробелов не допускается.
+          example: Москва, район Сокол
+          pattern: \S
+        volunteersNeeded:
+          type: integer
+          minimum: 1
+          description: Требуемое количество волонтеров. Если не передано, количество не указано.
+        offer:
+          type: string
+          description: Что автор может предложить взамен.
+        files:
+          type: array
+          minItems: 1
+          description: Фотографии и видео. Тип и допустимый размер проверяются сервером.
+          items:
+            type: string
+            format: binary
+          maxItems: 10
+        searchDeadline:
+          type: string
+          format: date-time
+          description: Необязательный срок поиска с часовым поясом. Должен быть в будущем. Без поля поиск
+            бессрочный; срок применяется только в open.
+    UpdateTaskRequest:
+      type: object
+      additionalProperties: false
+      minProperties: 1
+      properties:
+        title:
+          type: string
+          minLength: 1
+          pattern: \S
+          description: Необязательное название заявки; строка из одних пробелов не допускается.
+        description:
+          type: string
+          minLength: 1
+          description: Новое описание; строка из одних пробелов не допускается.
+          maxLength: 1000
+          pattern: \S
+        location:
+          type: string
+          minLength: 1
+          description: Новое место помощи; строка из одних пробелов не допускается.
+          pattern: \S
+        volunteersNeeded:
+          type: integer
+          minimum: 1
+          description: Новое количество волонтеров; меньше числа одобренных участников — 409.
+        offer:
+          type: string
+          description: Новое предложение взамен; пустая строка очищает значение.
+        files:
+          type: array
+          minItems: 1
+          description: Новые фотографии и видео, добавляемые к существующим.
+          items:
+            type: string
+            format: binary
+          maxItems: 10
+        removeFileIds:
+          type: array
+          minItems: 1
+          uniqueItems: true
+          description: Идентификаторы удаляемых вложений этой заявки; неизвестный id — 400.
+          items:
+            type: string
+            minLength: 1
+          maxItems: 10
+    TaskStatus:
+      type: string
+      description: |-
+        open — поиск волонтеров, в том числе с уже одобренными участниками;
+        in_progress — выполнение; closed — закрыта без выполнения; completed — выполнена автором.
+        В open достижение требуемого числа одобренных участников запускает выполнение автоматически.
+        При неопределенном количестве старт только вручную, минимум с одним участником.
+        Возврат к поиску — по решению автора для добора или при отказе последнего участника.
+        В open истечение searchDeadline автоматически закрывает заявку; в in_progress срок не действует.
+        closed можно открыть заново; completed — конечное состояние.
+      enum:
+        - open
+        - in_progress
+        - closed
+        - completed
+    Task:
+      type: object
+      required:
+        - id
+        - authorId
+        - description
+        - location
+        - status
+        - files
+        - createdAt
+        - updatedAt
+        - assigneeIds
+        - acceptingResponses
+        - searchDeadline
+      properties:
+        title:
+          type: string
+          minLength: 1
+          pattern: \S
+          description: Необязательное название заявки; строка из одних пробелов не допускается.
+        id:
+          type: string
+          example: task-42
+        authorId:
+          type: string
+          format: uuid
+          description: Идентификатор автора.
+        description:
+          type: string
+          maxLength: 1000
+        location:
+          type: string
+        volunteersNeeded:
+          type: integer
+          minimum: 1
+          description: Отсутствует, если количество не указано.
+        offer:
+          type: string
+          description: Отсутствует, если предложение не указано или очищено.
+        status:
+          $ref: '#/components/schemas/TaskStatus'
+        files:
+          type: array
+          items:
+            $ref: '#/components/schemas/Attachment'
+          maxItems: 10
+        createdAt:
+          type: string
+          format: date-time
+        updatedAt:
+          type: string
+          format: date-time
+        assigneeIds:
+          type: array
+          uniqueItems: true
+          description: ID одобренных участников; сохраняются при доборе и завершении, удаляются при отказе.
+            При закрытии список очищается, история остается в откликах.
+          items:
+            type: string
+            format: uuid
+        acceptingResponses:
+          type: boolean
+          description: 'Вычисляется сервером: статус open, срок поиска не истек и есть места. Если volunteersNeeded
+            не указан, количественного ограничения нет. В in_progress, closed и completed набор закрыт.'
+        searchDeadline:
+          type: string
+          format: date-time
+          nullable: true
+          description: Текущий срок поиска; null — бессрочно. Проверяется только в open. При ручном возврате
+            в open устанавливается заново.
+        closeReason:
+          type: string
+          enum:
+            - author_closed
+            - search_expired
+          description: Причина текущего closed; отсутствует после повторного открытия.
+        closeComment:
+          type: string
+          maxLength: 1000
+          description: Публичное пояснение автора при закрытии, если передано. Очищается при повторном
+            открытии.
+    Attachment:
+      type: object
+      required:
+        - id
+        - url
+        - mediaType
+      properties:
+        id:
+          type: string
+        url:
+          type: string
+          format: uri
+          description: Адрес для получения файла.
+        mediaType:
+          type: string
+          description: Фактический MIME-тип фотографии или видео.
+          example: image/jpeg
+    TaskResponse:
+      type: object
+      required:
+        - id
+        - taskId
+        - volunteerId
+        - status
+        - createdAt
+        - updatedAt
+      properties:
+        id:
+          type: string
+        taskId:
+          type: string
+        volunteerId:
+          type: string
+          format: uuid
+        status:
+          $ref: '#/components/schemas/ResponseStatus'
+        createdAt:
+          type: string
+          format: date-time
+        updatedAt:
+          type: string
+          format: date-time
+        decisionReason:
+          type: string
+          maxLength: 1000
+          description: Пояснение отклонения или отмены. При закрытии сервер указывает причину закрытия
+            заявки.
+    Error:
+      type: object
+      required:
+        - code
+        - message
+      properties:
+        code:
+          type: string
+          description: Машиночитаемый код ошибки.
+          example: VALIDATION_ERROR
+        message:
+          type: string
+          description: Пояснение ошибки.
+          example: Не указано место оказания помощи
+    ResponseStatus:
+      type: string
+      enum:
+        - pending
+        - approved
+        - rejected
+        - withdrawn
+        - cancelled
+      description: pending — ожидает решения; approved — участник одобрен; rejected — отклонен; withdrawn
+        — волонтер отозвал отклик или отказался; cancelled — участие или ожидающий отклик отменены закрытием
+        заявки. История сохраняется.
+    TaskResponsePage:
+      type: object
+      required:
+        - items
+        - total
+        - limit
+        - offset
+      properties:
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/TaskResponse'
+        total:
+          type: integer
+          minimum: 0
+          description: Общее число откликов с учетом фильтров.
+        limit:
+          type: integer
+          minimum: 1
+          maximum: 100
+        offset:
+          type: integer
+          minimum: 0
+    DecideTaskResponseRequest:
+      type: object
+      additionalProperties: false
+      required:
+        - status
+      properties:
+        status:
+          type: string
+          enum:
+            - approved
+            - rejected
+        reason:
+          type: string
+          minLength: 1
+          maxLength: 1000
+          pattern: \S
+          description: Необязательная причина только для rejected; при approved передача reason — 400.
+    ChangeTaskStatusRequest:
+      type: object
+      additionalProperties: false
+      required:
+        - status
+      properties:
+        status:
+          type: string
+          enum:
+            - open
+            - in_progress
+            - closed
+            - completed
+        searchDeadline:
+          type: string
+          format: date-time
+          nullable: true
+          description: 'Обязателен только при переходе в open: будущая дата с часовым поясом либо null
+            для бессрочного поиска.'
+        reason:
+          type: string
+          minLength: 1
+          maxLength: 1000
+          pattern: \S
+          description: Необязательная публичная причина закрытия; только для closed.
+      oneOf:
+        - properties:
+            status:
+              enum:
+                - open
+          required:
+            - searchDeadline
+          not:
+            required:
+              - reason
+        - properties:
+            status:
+              enum:
+                - closed
+          not:
+            required:
+              - searchDeadline
+        - properties:
+            status:
+              enum:
+                - in_progress
+                - completed
+          not:
+            anyOf:
+              - required:
+                  - reason
+              - required:
+                  - searchDeadline
+  responses:
+    AuthTokens:
+      description: Сессия авторизована; access в JSON, новый refresh в HttpOnly cookie.
+      headers:
+        Set-Cookie:
+          $ref: '#/components/headers/RefreshCookie'
+        Cache-Control:
+          $ref: '#/components/headers/NoStore'
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/AuthTokenResponse'
+    AuthUnauthorized:
+      description: |-
+        Неверные учетные данные (INVALID_CREDENTIALS) либо отсутствующий,
+        истекший, отозванный или уже использованный refresh (INVALID_REFRESH_TOKEN).
+        Access Bearer не требуется для этих операций.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+    AuthOriginRejected:
+      description: Origin запроса не разрешен (ORIGIN_NOT_ALLOWED).
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+    BadRequest:
+      description: Некорректные параметры или тело запроса.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+    Unauthorized:
+      description: Токен авторизации отсутствует или недействителен.
+      headers:
+        WWW-Authenticate:
+          description: Схема аутентификации, необходимая для доступа.
+          schema:
+            type: string
+            example: Bearer
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+    Forbidden:
+      description: Пользователь авторизован, но не имеет права выполнить операцию.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+    NotFound:
+      description: Заявка или отклик не найдены, либо отклик не принадлежит указанной заявке.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+    Conflict:
+      description: Операция конфликтует с текущим состоянием заявки или отклика.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+    PayloadTooLarge:
+      description: Превышен допустимый размер загружаемых данных.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+    UnsupportedMediaType:
+      description: Неподдерживаемый Content-Type запроса или формат вложенного файла.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
