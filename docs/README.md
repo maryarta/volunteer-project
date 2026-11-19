@@ -27,4 +27,4 @@
 * Управляет откликами волонтёров и статусами заявок.
 
 Обмен сообщениями между сервисами выполняется через Kafka.
-![backend_architecture.png](backend_architecture.png)
+![architecture_backend.png](architecture_backend.png)
