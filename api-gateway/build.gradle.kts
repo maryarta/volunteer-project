@@ -2,13 +2,10 @@ description = "api-gateway"
 
 dependencies {
 
-    add(
-        "implementation",
+    implementation(
         platform("org.springframework.cloud:spring-cloud-dependencies:2025.0.3")
     )
-
-    add(
-        "implementation",
+    implementation(
         "org.springframework.cloud:spring-cloud-starter-gateway-server-webflux"
     )
     implementation("org.springframework.boot:spring-boot-starter-actuator")
@@ -17,10 +14,12 @@ dependencies {
     implementation("org.springframework.boot:spring-boot-starter-oauth2-resource-server")
     implementation("org.springframework.boot:spring-boot-starter-data-redis-reactive")
     implementation("org.springframework.boot:spring-boot-starter-validation")
-    add(
-        "implementation",
-        "org.springdoc:springdoc-openapi-starter-webflux-ui:2.10.0"
-    )
+    implementation("org.springdoc:springdoc-openapi-starter-webflux-ui:2.10.0")
+
+//    testImplementation("org.wiremock:wiremock-standalone:3.12.2")
+    testImplementation("org.wiremock:wiremock-jetty12:3.13.2")
+//    testImplementation("org.wiremock:wiremock:3.13.2")
+//    testImplementation("org.testcontainers:testcontainers")
 }
 
 tasks.named<org.gradle.language.jvm.tasks.ProcessResources>("processResources") {
