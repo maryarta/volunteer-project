@@ -39,6 +39,10 @@ subprojects {
             "testRuntimeOnly",
             "org.junit.platform:junit-platform-launcher"
         )
+        add(
+            "testImplementation",
+            "org.testcontainers:testcontainers:1.21.4"
+        )
     }
 
     tasks.withType<Test>().configureEach {
