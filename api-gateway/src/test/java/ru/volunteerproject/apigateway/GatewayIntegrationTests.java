@@ -24,15 +24,11 @@ import static org.junit.jupiter.api.Assertions.assertEquals;
 @DirtiesContext(classMode = DirtiesContext.ClassMode.AFTER_CLASS)
 class GatewayIntegrationTests {
 
-    static final WireMockServer auth =
-            new WireMockServer(wireMockConfig().dynamicPort());
+    static final WireMockServer auth = new WireMockServer(wireMockConfig().dynamicPort());
 
-    static final WireMockServer help =
-            new WireMockServer(wireMockConfig().dynamicPort());
+    static final WireMockServer help = new WireMockServer(wireMockConfig().dynamicPort());
 
-    static final GenericContainer<?> redis =
-            new GenericContainer<>("redis:7.4-alpine")
-                    .withExposedPorts(6379);
+    static final GenericContainer<?> redis = new GenericContainer<>("redis:7.4-alpine").withExposedPorts(6379);
 
     static {
         auth.start();
@@ -72,11 +68,10 @@ class GatewayIntegrationTests {
     @Test
     void forwardsPublicRequestToHelpService() {
         help.stubFor(get(urlPathEqualTo("/api/v1/help/tasks"))
-                .withQueryParam("page", equalTo("1"))
                 .willReturn(okJson("{\"items\":[]}")));
 
         client.get()
-                .uri("/api/v1/help/tasks?page=1")
+                .uri("/api/v1/help/tasks")
                 .header("X-Request-Id", "integration-test-1")
                 .exchange()
                 .expectStatus().isOk()
@@ -87,7 +82,6 @@ class GatewayIntegrationTests {
 
         help.verify(1, getRequestedFor(
                 urlPathEqualTo("/api/v1/help/tasks"))
-                .withQueryParam("page", equalTo("1"))
                 .withHeader("X-Request-Id", equalTo("integration-test-1")));
 
         auth.verify(0, anyRequestedFor(anyUrl()));

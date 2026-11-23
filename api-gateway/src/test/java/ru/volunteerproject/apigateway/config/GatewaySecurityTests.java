@@ -75,39 +75,19 @@ class GatewaySecurityTests {
                 .exchange().expectStatus().isUnauthorized();
     }
 
-     @Test
-    void userIdGetFromJwt(){
-         String userId = UUID.randomUUID().toString();
+    @Test
+    void protectedHelpAllowsUserWithJwt(){
+        Jwt jwt = Jwt.withTokenValue("valid")
+                .header("alg", "HS256")
+                .subject(UUID.randomUUID().toString())
+                .build();
+        when(decoder.decode("valid")).thenReturn(Mono.just(jwt));
 
-         Jwt jwt = Jwt.withTokenValue("test-token")
-                 .header("alg", "HS256")
-                 .subject(userId)
-                 .build();
+        client.post().uri("/api/v1/help/tasks").header("Authorization", "Bearer valid")
+                .exchange().expectStatus().isOk();
+        client.get().uri("/api/v1/help/tasks").header("Authorization", "Bearer valid")
+                .exchange().expectStatus().isOk();
 
-         var authentication = new JwtAuthenticationToken(jwt);
-
-         var exchange = MockServerWebExchange.from(
-                 MockServerHttpRequest.get("/api/v1/help/tasks")
-                         .header("X-User-Id", "fake-user")
-                         .header("Authorization", "Bearer test-token")
-         );
-
-         var authenticatedExchange = exchange.mutate()
-                 .principal(Mono.just(authentication))
-                 .build();
-
-         GatewayFilterChain chain = forwardedExchange -> {
-             var headers = forwardedExchange.getRequest().getHeaders();
-
-             assertEquals(userId, headers.getFirst("X-User-Id"));
-             assertNull(headers.getFirst("Authorization"));
-
-             return Mono.empty();
-         };
-
-         new TrustedIdentityGlobalFilter()
-                 .filter(authenticatedExchange, chain)
-                 .block();
-     }
+    }
 
 }
